@@ -1,22 +1,19 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { logger } from './logger';
 
+// Only real, verified production Gemini models — ordered fastest-to-slowest.
+// Fake models (gemini-3.x-flash, etc.) have been removed to prevent guaranteed 404 retries.
 export let DISCOVERED_MODELS: string[] = [
-  'gemini-2.5-flash',
-  'gemini-2.5-pro',
   'gemini-2.0-flash',
+  'gemini-2.5-flash',
   'gemini-1.5-flash',
   'gemini-1.5-pro',
-  'gemini-3.5-flash',
-  'gemini-3.5-flash-lite',
-  'gemini-3.6-flash',
-  'gemini-3.1-flash-lite',
-  'gemini-2.0-flash-lite',
-  'gemini-2.5-flash-lite',
-  'gemini-1.5-flash-latest',
-  'gemini-1.5-pro-latest',
-  'gemini-2.5-flash-latest',
+  'gemini-2.5-pro',
 ];
+
+// Remembers the last model that responded successfully — used as a fast-path
+// shortcut on the next call to avoid re-trying slower fallback models.
+let lastWorkingModel: string | null = null;
 
 interface KeyClient {
   client: GoogleGenerativeAI;
@@ -96,6 +93,10 @@ function getKeyClients(): KeyClient[] {
 }
 
 export async function runGeminiDiagnostic() {
+  if (process.env.NODE_ENV === 'development') {
+    logger.info('Skipping Gemini startup diagnostic in development mode to optimize reload speed.');
+    return;
+  }
   const clients = getKeyClients();
   if (clients.length > 0 && clients[0].rawKey !== 'INVALID_KEY') {
     await runModelDiagnostic(clients[0]);
@@ -118,14 +119,26 @@ export async function generateJson<T>(
   let lastError: any = null;
 
   const clients = getKeyClients();
-  // Ensure we attempt to try all discovered models and API keys if needed
-  const totalAttempts = Math.max(maxRetries + 1, DISCOVERED_MODELS.length * clients.length);
 
-  // We iterate through combinations of candidate models and load-balanced API keys
-  for (let attempt = 0; attempt < totalAttempts; attempt++) {
+  // Hard-cap at 3 attempts maximum to prevent extreme retry storms.
+  // The old formula (DISCOVERED_MODELS.length * clients.length) could reach 14+ retries
+  // each with up to 2500ms backoff = 35+ seconds of pure waiting before giving up.
+  const maxAttempts = Math.min(maxRetries + 1, 3);
+
+  // Build a prioritized model list: try lastWorkingModel first (fast-path),
+  // then fall back through remaining known-good models.
+  const candidateModels: string[] = [];
+  if (lastWorkingModel && DISCOVERED_MODELS.includes(lastWorkingModel)) {
+    candidateModels.push(lastWorkingModel);
+  }
+  for (const m of DISCOVERED_MODELS) {
+    if (m !== lastWorkingModel) candidateModels.push(m);
+  }
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const keyClient = getNextKeyClient(attempt);
-    // Cycle through stable discovered models
-    const modelName = DISCOVERED_MODELS[attempt % DISCOVERED_MODELS.length];
+    // Pick model from prioritized list — fast-path model first
+    const modelName = candidateModels[attempt % candidateModels.length];
 
     const model = keyClient.client.getGenerativeModel({
       model: modelName,
@@ -154,6 +167,9 @@ export async function generateJson<T>(
         status: 200,
       }, '⚡ Gemini AI Request Successful');
 
+      // Cache the winning model for the next call (fast-path optimisation)
+      lastWorkingModel = modelName;
+
       // Extract JSON from response (strip markdown fences if present)
       const jsonMatch = text.match(/```(?:json)?\n([\s\S]*?)\n```/) || text.match(/\[[\s\S]*\]|\{[\s\S]*\}/);
       const jsonString = jsonMatch ? (jsonMatch[1] || jsonMatch[0]) : text;
@@ -166,39 +182,43 @@ export async function generateJson<T>(
       const is404 = errorMessage.includes('404') || errorMessage.includes('not found');
 
       if (is404) {
-        // Permanently purge failing 404 model from DISCOVERED_MODELS to prevent future attempts
+        // Permanently purge failing 404 model from both DISCOVERED_MODELS and candidateModels
         DISCOVERED_MODELS = DISCOVERED_MODELS.filter(m => m !== modelName);
+        candidateModels.splice(candidateModels.indexOf(modelName), 1);
         if (DISCOVERED_MODELS.length === 0) {
           DISCOVERED_MODELS = ['gemini-1.5-flash', 'gemini-1.5-pro'];
         }
+        // Clear cached model if it was the one that 404'd
+        if (lastWorkingModel === modelName) lastWorkingModel = null;
       }
 
       // Check if error is non-retriable (e.g. invalid auth key, or bad request/blocked input)
-      const isNonRetriable = (errorMessage.includes('400') && !errorMessage.includes('schema') && !errorMessage.includes('mimeType')) || 
-                             ((errorMessage.includes('401') || errorMessage.includes('403') || errorMessage.includes('API key not valid')) && clients.length <= 1);
+      const isNonRetriable =
+        (errorMessage.includes('400') && !errorMessage.includes('schema') && !errorMessage.includes('mimeType')) ||
+        ((errorMessage.includes('401') || errorMessage.includes('403') || errorMessage.includes('API key not valid')) && clients.length <= 1);
 
       logger.warn({
         model: modelName,
         apiKey: keyClient.maskedKey,
         attempt: attempt + 1,
-        maxRetries: totalAttempts,
+        maxAttempts,
         durationMs,
         is404,
         isNonRetriable,
         err: errorMessage,
-      }, `Gemini AI Request Failed (${is404 ? 'Model 404 Not Found — Purged' : isNonRetriable ? 'Non-Retriable Error' : 'API Error'}). Fallback rotating model & API key...`);
+      }, `Gemini AI Request Failed (${is404 ? 'Model 404 — Purged' : isNonRetriable ? 'Non-Retriable' : 'API Error'}). ${ attempt < maxAttempts - 1 ? 'Retrying next model...' : 'All attempts exhausted.'}`);
 
       if (isNonRetriable) {
         throw error;
       }
 
-      if (attempt < totalAttempts - 1) {
-        // Backoff delay before next attempt
-        await new Promise((resolve) => setTimeout(resolve, Math.min((attempt + 1) * 800, 2500)));
+      // Shorter backoff: 500ms flat delay (no exponential growth up to 2500ms)
+      if (attempt < maxAttempts - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
       }
     }
   }
 
-  logger.error({ err: lastError?.message || lastError }, '❌ All Gemini AI candidate models and key retries failed.');
+  logger.error({ err: lastError?.message || lastError }, '❌ All Gemini AI candidate models exhausted after max retries.');
   throw lastError || new Error('Gemini AI request failed after all retries');
 }
